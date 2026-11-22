@@ -18,7 +18,8 @@ async function init() {
   create table if not exists messages(id serial primary key, group_id int, username text, text text, created_at timestamptz default now());
   create table if not exists friendships(a int, b int, status text, primary key(a,b));
   create table if not exists channels(id serial primary key, group_id int, name text, type text);
-  alter table messages add column if not exists channel_id int;`);
+  alter table messages add column if not exists channel_id int;
+  alter table users add column if not exists avatar text;`);
 }
 const sign = u => jwt.sign({ id: u.id, username: u.username }, SECRET, { expiresIn: '30d' });
 const auth = (req, res, next) => {
@@ -48,7 +49,7 @@ app.post('/login', async (req, res) => {
   const u = r.rows[0];
   if (!u || !(await bcrypt.compare(password || '', u.password_hash)))
     return res.status(401).json({ error: 'E-mail ou senha incorretos' });
-  res.json({ token: sign(u), user: { id: u.id, username: u.username } });
+  res.json({ token: sign(u), user: { id: u.id, username: u.username, avatar: u.avatar } });
 });
 
 const uids = c => c.name.split(':').slice(1).map(Number);
@@ -92,14 +93,14 @@ app.post('/groups/:id/channels', auth, async (req, res) => {
 });
 app.get('/channels/:id/messages', auth, async (req, res) => {
   if (!(await access(req.user.id, req.params.id))) return res.status(403).json({ error: 'Sem acesso' });
-  res.json((await q('select username,text,created_at from messages where channel_id=$1 order by id desc limit 50', [req.params.id])).rows.reverse());
+  res.json((await q('select m.username,m.text,m.created_at,u.avatar from messages m left join users u on u.username=m.username where m.channel_id=$1 order by m.id desc limit 50', [req.params.id])).rows.reverse());
 });
 
 // ---- Amigos e mensagens diretas ----
 app.get('/friends', auth, async (req, res) => {
   const id = req.user.id;
-  const r = (await q(`select f.a,f.b,f.status,u.id uid,u.username from friendships f join users u on u.id=(case when f.a=$1 then f.b else f.a end) where f.a=$1 or f.b=$1`, [id])).rows;
-  const pick = fn => r.filter(fn).map(x => ({ id: x.uid, username: x.username }));
+  const r = (await q(`select f.a,f.b,f.status,u.id uid,u.username,u.avatar from friendships f join users u on u.id=(case when f.a=$1 then f.b else f.a end) where f.a=$1 or f.b=$1`, [id])).rows;
+  const pick = fn => r.filter(fn).map(x => ({ id: x.uid, username: x.username, avatar: x.avatar }));
   res.json({ friends: pick(x => x.status === 'ok'), incoming: pick(x => x.status === 'pending' && x.b === id), outgoing: pick(x => x.status === 'pending' && x.a === id) });
 });
 app.post('/friends/request', auth, async (req, res) => {
@@ -124,27 +125,53 @@ app.get('/dm/:uid', auth, async (req, res) => {
   res.json({ id: c.id });
 });
 
+app.post('/me/avatar', auth, async (req, res) => {
+  const a = req.body.avatar;
+  if (!a || !a.startsWith('data:image/') || a.length > 200000) return res.status(400).json({ error: 'Imagem inválida ou muito grande' });
+  await q('update users set avatar=$1 where id=$2', [a, req.user.id]); res.json({ ok: true });
+});
+async function voiceUsers(cid) {
+  const n = [...(io.sockets.adapter.rooms.get('v' + cid) || [])].map(id => io.sockets.sockets.get(id).user.username);
+  return n.length ? (await q('select username,avatar from users where username=any($1)', [n])).rows : [];
+}
+async function pushVoice(cid) {
+  const c = (await q('select * from channels where id=$1', [cid])).rows[0];
+  if (c && c.type !== 'dm') io.to('grp' + c.group_id).emit('voice:users', { cid: +cid, users: await voiceUsers(cid) });
+}
+
 // ---- Tempo real: chat + sinalização WebRTC ----
 io.use((s, next) => {
   try { s.user = jwt.verify(s.handshake.auth.token, SECRET); next(); } catch { next(new Error('auth')); }
 });
 io.on('connection', socket => {
   const uid = socket.user.id; socket.join('u' + uid);
+  q('select group_id from members where user_id=$1', [uid]).then(r => r.rows.forEach(x => socket.join('grp' + x.group_id)));
   socket.on('chat:join', async cid => { if (await access(uid, cid)) socket.join('c' + cid); });
   socket.on('chat:send', async ({ cid, text }) => {
     if (!text || !(await access(uid, cid))) return;
     await q('insert into messages(channel_id,username,text) values($1,$2,$3)', [cid, socket.user.username, text]);
-    io.to('c' + cid).emit('chat:msg', { cid, username: socket.user.username, text, created_at: new Date() });
+    const av = (await q('select avatar from users where id=$1', [uid])).rows[0];
+    io.to('c' + cid).emit('chat:msg', { cid, username: socket.user.username, text, created_at: new Date(), avatar: av && av.avatar });
+  });
+  socket.on('voice:query', async gid => {
+    if (!(await q('select 1 from members where group_id=$1 and user_id=$2', [gid, uid])).rowCount) return;
+    socket.join('grp' + gid);
+    for (const c of (await q(`select id from channels where group_id=$1 and type='voice'`, [gid])).rows) socket.emit('voice:users', { cid: c.id, users: await voiceUsers(c.id) });
   });
   socket.on('voice:join', async cid => {
     const c = await access(uid, cid); if (!c) return;
     const room = 'v' + cid;
     const others = [...(io.sockets.adapter.rooms.get(room) || [])].map(id => ({ id, username: io.sockets.sockets.get(id).user.username }));
-    socket.voiceRoom = room; socket.join(room); socket.emit('voice:peers', others);
-    if (c.type === 'dm' && !others.length) { const o = uids(c).find(x => x !== uid); io.to('u' + o).emit('call:ring', { username: socket.user.username, cid }); }
+    socket.voiceRoom = room; socket.voiceCid = cid; socket.join(room); socket.emit('voice:peers', others); pushVoice(cid);
+    if (c.type === 'dm' && !others.length) { const o = uids(c).find(x => x !== uid); socket.ringTo = o; io.to('u' + o).emit('call:ring', { username: socket.user.username, cid }); }
   });
   socket.on('voice:signal', ({ to, data }) => io.to(to).emit('voice:signal', { from: socket.id, username: socket.user.username, data }));
-  const leave = () => { if (socket.voiceRoom) { socket.to(socket.voiceRoom).emit('voice:left', socket.id); socket.leave(socket.voiceRoom); socket.voiceRoom = null; } };
+  const leave = () => {
+    if (!socket.voiceRoom) return;
+    socket.to(socket.voiceRoom).emit('voice:left', socket.id); socket.leave(socket.voiceRoom);
+    const cid = socket.voiceCid; socket.voiceRoom = null; pushVoice(cid);
+    if (socket.ringTo) { io.to('u' + socket.ringTo).emit('call:cancel'); socket.ringTo = null; }
+  };
   socket.on('voice:leave', leave); socket.on('disconnect', leave);
 });
 
