@@ -34,6 +34,16 @@ const auth = (req, res, next) => {
 
 app.get('/', (_, res) => res.send('Lindesk server online'));
 
+// ---- Servidores STUN/TURN (Metered) para as chamadas ----
+app.get('/ice', auth, async (_, res) => {
+  const fallback = [{ urls: 'stun:stun.l.google.com:19302' }];
+  try {
+    const r = await fetch(`https://${process.env.METERED_APP}.metered.live/api/v1/turn/credentials?apiKey=${process.env.METERED_KEY}`);
+    const j = await r.json();
+    res.json(r.ok && Array.isArray(j) && j.length ? j : fallback);
+  } catch { res.json(fallback); }
+});
+
 app.post('/register', async (req, res) => {
   const { username, email, password } = req.body;
   if (!username || !email || !password || password.length < 6)
