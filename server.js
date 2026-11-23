@@ -143,6 +143,14 @@ async function deleteGroup(gid) {
   io.to('grp' + gid).emit('group:deleted', +gid);
 }
 const changed = gid => io.to('grp' + gid).emit('group:changed', +gid);
+app.post('/groups/:id/leave', auth, async (req, res) => {
+  const r = await roleOf(req.user.id, req.params.id);
+  if (!r) return res.status(404).json({ error: 'Você não está neste grupo' });
+  if (r === 'owner') return res.status(400).json({ error: 'O dono não pode sair do próprio grupo. Apague o grupo se quiser encerrá-lo.' });
+  await q('delete from members where group_id=$1 and user_id=$2', [req.params.id, req.user.id]);
+  io.in('u' + req.user.id).emit('group:left', +req.params.id); io.in('u' + req.user.id).socketsLeave('grp' + req.params.id);
+  changed(req.params.id); res.json({ ok: true });
+});
 app.delete('/groups/:id', auth, async (req, res) => {
   if ((await roleOf(req.user.id, req.params.id)) !== 'owner') return res.status(403).json({ error: 'Só o dono apaga o grupo' });
   await deleteGroup(req.params.id); res.json({ ok: true });
