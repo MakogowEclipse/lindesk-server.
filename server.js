@@ -20,6 +20,7 @@ async function init() {
   create table if not exists channels(id serial primary key, group_id int, name text, type text);
   alter table messages add column if not exists channel_id int;
   alter table users add column if not exists avatar text;
+  alter table users add column if not exists status text default 'online';
   alter table chat_groups add column if not exists avatar text;
   alter table members add column if not exists role text default 'member';
   alter table channels add column if not exists perm_view text default 'all';
@@ -53,7 +54,7 @@ app.post('/login', async (req, res) => {
   const u = r.rows[0];
   if (!u || !(await bcrypt.compare(password || '', u.password_hash)))
     return res.status(401).json({ error: 'E-mail ou senha incorretos' });
-  res.json({ token: sign(u), user: { id: u.id, username: u.username, avatar: u.avatar } });
+  res.json({ token: sign(u), user: { id: u.id, username: u.username, avatar: u.avatar, status: u.status } });
 });
 
 const uids = c => c.name.split(':').slice(1).map(Number);
@@ -111,7 +112,7 @@ app.get('/channels/:id/messages', auth, async (req, res) => {
 app.get('/friends', auth, async (req, res) => {
   const id = req.user.id;
   const r = (await q(`select f.a,f.b,f.status,u.id uid,u.username,u.avatar from friendships f join users u on u.id=(case when f.a=$1 then f.b else f.a end) where f.a=$1 or f.b=$1`, [id])).rows;
-  const pick = fn => r.filter(fn).map(x => ({ id: x.uid, username: x.username, avatar: x.avatar }));
+  const pick = fn => r.filter(fn).map(x => ({ id: x.uid, username: x.username, avatar: x.avatar, status: presenceOf(x.uid) }));
   res.json({ friends: pick(x => x.status === 'ok'), incoming: pick(x => x.status === 'pending' && x.b === id), outgoing: pick(x => x.status === 'pending' && x.a === id) });
 });
 app.post('/friends/request', auth, async (req, res) => {
@@ -119,10 +120,10 @@ app.post('/friends/request', auth, async (req, res) => {
   if (!u || u.id === req.user.id) return res.status(404).json({ error: 'Usuário não encontrado' });
   const rev = await q(`update friendships set status='ok' where a=$1 and b=$2`, [u.id, req.user.id]);
   if (!rev.rowCount) await q(`insert into friendships values($1,$2,'pending') on conflict do nothing`, [req.user.id, u.id]);
-  ping(req.user.id, u.id); res.json({ ok: true });
+  ping(req.user.id, u.id); io.to('u' + u.id).emit('notify', { kind: rev.rowCount ? 'friendok' : 'friend', username: req.user.username }); res.json({ ok: true });
 });
 app.post('/friends/accept', auth, async (req, res) => {
-  await q(`update friendships set status='ok' where a=$1 and b=$2`, [req.body.id, req.user.id]); ping(req.user.id, req.body.id); res.json({ ok: true });
+  await q(`update friendships set status='ok' where a=$1 and b=$2`, [req.body.id, req.user.id]); ping(req.user.id, req.body.id); io.to('u' + req.body.id).emit('notify', { kind: 'friendok', username: req.user.username }); res.json({ ok: true });
 });
 app.post('/friends/remove', auth, async (req, res) => {
   await q('delete from friendships where (a=$1 and b=$2) or (a=$2 and b=$1)', [req.user.id, req.body.id]); ping(req.user.id, req.body.id); res.json({ ok: true });
@@ -175,6 +176,21 @@ app.delete('/me', auth, async (req, res) => {
   await q('delete from messages where username=$1', [u.username]); await q('delete from users where id=$1', [u.id]);
   io.in('u' + u.id).disconnectSockets(true); res.json({ ok: true });
 });
+// ---- Presença (online / não perturbe / offline) ----
+const statusMap = new Map();
+function presenceOf(uid) {
+  const room = io.sockets.adapter.rooms.get('u' + uid), s = statusMap.get(uid) || 'online';
+  return !room || !room.size || s === 'offline' ? 'offline' : s;
+}
+async function broadcast(uid) {
+  const st = presenceOf(uid);
+  const r = await q(`select case when a=$1 then b else a end fid from friendships where status='ok' and (a=$1 or b=$1)`, [uid]);
+  [...r.rows.map(x => x.fid), uid].forEach(f => io.to('u' + f).emit('presence', { id: uid, status: st }));
+}
+app.post('/me/status', auth, async (req, res) => {
+  const s = ['online', 'dnd', 'offline'].includes(req.body.status) ? req.body.status : 'online';
+  await q('update users set status=$1 where id=$2', [s, req.user.id]); statusMap.set(req.user.id, s); broadcast(req.user.id); res.json({ ok: true });
+});
 app.post('/me/avatar', auth, async (req, res) => {
   const a = req.body.avatar;
   if (!a || !a.startsWith('data:image/') || a.length > 200000) return res.status(400).json({ error: 'Imagem inválida ou muito grande' });
@@ -195,6 +211,8 @@ io.use((s, next) => {
 });
 io.on('connection', socket => {
   const uid = socket.user.id; socket.join('u' + uid);
+  q('select status from users where id=$1', [uid]).then(r => { statusMap.set(uid, (r.rows[0] && r.rows[0].status) || 'online'); broadcast(uid); });
+  socket.on('disconnect', () => broadcast(uid));
   q('select group_id from members where user_id=$1', [uid]).then(r => r.rows.forEach(x => socket.join('grp' + x.group_id)));
   socket.on('chat:join', async cid => { if (await access(uid, cid)) socket.join('c' + cid); });
   socket.on('chat:send', async ({ cid, text }) => {
@@ -203,6 +221,7 @@ io.on('connection', socket => {
     await q('insert into messages(channel_id,username,text) values($1,$2,$3)', [cid, socket.user.username, text]);
     const av = (await q('select avatar from users where id=$1', [uid])).rows[0];
     io.to('c' + cid).emit('chat:msg', { cid, username: socket.user.username, text, created_at: new Date(), avatar: av && av.avatar });
+    if (c.type === 'dm') { const o = uids(c).find(x => x !== uid); io.to('u' + o).emit('notify', { kind: 'dm', cid, username: socket.user.username, text: text.slice(0, 120) }); }
   });
   socket.on('voice:query', async gid => {
     if (!(await q('select 1 from members where group_id=$1 and user_id=$2', [gid, uid])).rowCount) return;
@@ -213,7 +232,7 @@ io.on('connection', socket => {
     const c = await access(uid, cid); if (!c) return;
     const room = 'v' + cid;
     const others = [...(io.sockets.adapter.rooms.get(room) || [])].map(id => ({ id, username: io.sockets.sockets.get(id).user.username }));
-    socket.voiceRoom = room; socket.voiceCid = cid; socket.join(room); socket.emit('voice:peers', others); pushVoice(cid);
+    socket.voiceRoom = room; socket.voiceCid = cid; socket.join(room); socket.emit('voice:peers', others); pushVoice(cid); socket.to(room).emit('voice:joined', { username: socket.user.username });
     if (c.type === 'dm' && !others.length) { const o = uids(c).find(x => x !== uid); socket.ringTo = o; io.to('u' + o).emit('call:ring', { username: socket.user.username, cid }); }
   });
   socket.on('voice:signal', ({ to, data }) => io.to(to).emit('voice:signal', { from: socket.id, username: socket.user.username, data }));
