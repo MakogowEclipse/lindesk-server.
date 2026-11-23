@@ -195,6 +195,10 @@ async function broadcast(uid) {
   const r = await q(`select case when a=$1 then b else a end fid from friendships where status='ok' and (a=$1 or b=$1)`, [uid]);
   [...r.rows.map(x => x.fid), uid].forEach(f => io.to('u' + f).emit('presence', { id: uid, status: st }));
 }
+app.get('/me', auth, async (req, res) => {
+  const u = (await q('select id,username,avatar,status from users where id=$1', [req.user.id])).rows[0];
+  if (!u) return res.status(401).json({ error: 'Não autenticado' }); res.json(u);
+});
 app.post('/me/status', auth, async (req, res) => {
   const s = ['online', 'dnd', 'offline'].includes(req.body.status) ? req.body.status : 'online';
   await q('update users set status=$1 where id=$2', [s, req.user.id]); statusMap.set(req.user.id, s); broadcast(req.user.id); res.json({ ok: true });
