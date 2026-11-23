@@ -19,7 +19,11 @@ async function init() {
   create table if not exists friendships(a int, b int, status text, primary key(a,b));
   create table if not exists channels(id serial primary key, group_id int, name text, type text);
   alter table messages add column if not exists channel_id int;
-  alter table users add column if not exists avatar text;`);
+  alter table users add column if not exists avatar text;
+  alter table chat_groups add column if not exists avatar text;
+  alter table members add column if not exists role text default 'member';
+  alter table channels add column if not exists perm_view text default 'all';
+  alter table channels add column if not exists perm_write text default 'all';`);
 }
 const sign = u => jwt.sign({ id: u.id, username: u.username }, SECRET, { expiresIn: '30d' });
 const auth = (req, res, next) => {
@@ -53,17 +57,24 @@ app.post('/login', async (req, res) => {
 });
 
 const uids = c => c.name.split(':').slice(1).map(Number);
+const roleOf = async (uid, gid) => {
+  const g = (await q('select owner_id from chat_groups where id=$1', [gid])).rows[0]; if (!g) return null;
+  if (g.owner_id === uid) return 'owner';
+  const m = (await q('select role from members where group_id=$1 and user_id=$2', [gid, uid])).rows[0]; return m ? (m.role || 'member') : null;
+};
+const isAdm = r => r === 'owner' || r === 'admin';
 async function access(uid, cid) {
   const c = (await q('select * from channels where id=$1', [cid])).rows[0]; if (!c) return null;
   if (c.type === 'dm') return uids(c).includes(uid) ? c : null;
-  return (await q('select 1 from members where group_id=$1 and user_id=$2', [c.group_id, uid])).rowCount ? c : null;
+  const r = await roleOf(uid, c.group_id); if (!r) return null;
+  c.admin = isAdm(r); return c.perm_view === 'admin' && !c.admin ? null : c;
 }
 const ping = (...ids) => ids.forEach(i => io.to('u' + i).emit('friends:update'));
 const areFriends = async (a, b) => (await q(`select 1 from friendships where status='ok' and ((a=$1 and b=$2) or (a=$2 and b=$1))`, [a, b])).rowCount > 0;
 
 // ---- Grupos e canais ----
 app.get('/groups', auth, async (req, res) => {
-  res.json((await q(`select g.id,g.name,g.code,g.owner_id from chat_groups g join members m on m.group_id=g.id where m.user_id=$1 order by g.id`, [req.user.id])).rows);
+  res.json((await q(`select g.id,g.name,g.code,g.owner_id,g.avatar,m.role from chat_groups g join members m on m.group_id=g.id where m.user_id=$1 order by g.id`, [req.user.id])).rows);
 });
 app.post('/groups', auth, async (req, res) => {
   const code = Math.random().toString(36).slice(2, 8).toUpperCase();
@@ -79,15 +90,15 @@ app.post('/groups/join', auth, async (req, res) => {
   res.json(g);
 });
 app.get('/groups/:id/channels', auth, async (req, res) => {
-  const m = await q('select 1 from members where group_id=$1 and user_id=$2', [req.params.id, req.user.id]);
-  if (!m.rowCount) return res.status(403).json({ error: 'Sem acesso' });
-  let r = await q('select id,name,type from channels where group_id=$1 order by id', [req.params.id]);
-  if (!r.rowCount) { await q(`insert into channels(group_id,name,type) values($1,'geral','text'),($1,'Sala de voz','voice')`, [req.params.id]); r = await q('select id,name,type from channels where group_id=$1 order by id', [req.params.id]); }
-  res.json(r.rows);
+  const role = await roleOf(req.user.id, req.params.id);
+  if (!role) return res.status(403).json({ error: 'Sem acesso' });
+  const sel = 'select id,name,type,perm_view,perm_write from channels where group_id=$1 order by id';
+  let r = await q(sel, [req.params.id]);
+  if (!r.rowCount) { await q(`insert into channels(group_id,name,type) values($1,'geral','text'),($1,'Sala de voz','voice')`, [req.params.id]); r = await q(sel, [req.params.id]); }
+  res.json(r.rows.filter(c => c.perm_view !== 'admin' || isAdm(role)));
 });
 app.post('/groups/:id/channels', auth, async (req, res) => {
-  const g = (await q('select owner_id from chat_groups where id=$1', [req.params.id])).rows[0];
-  if (!g || g.owner_id !== req.user.id) return res.status(403).json({ error: 'Só o dono do grupo cria canais' });
+  if (!isAdm(await roleOf(req.user.id, req.params.id))) return res.status(403).json({ error: 'Só admins criam canais' });
   const type = req.body.type === 'voice' ? 'voice' : 'text';
   res.json((await q('insert into channels(group_id,name,type) values($1,$2,$3) returning id,name,type', [req.params.id, req.body.name, type])).rows[0]);
 });
@@ -125,6 +136,45 @@ app.get('/dm/:uid', auth, async (req, res) => {
   res.json({ id: c.id });
 });
 
+async function deleteGroup(gid) {
+  await q('delete from messages where channel_id in (select id from channels where group_id=$1)', [gid]);
+  await q('delete from channels where group_id=$1', [gid]); await q('delete from members where group_id=$1', [gid]); await q('delete from chat_groups where id=$1', [gid]);
+  io.to('grp' + gid).emit('group:deleted', +gid);
+}
+const changed = gid => io.to('grp' + gid).emit('group:changed', +gid);
+app.delete('/groups/:id', auth, async (req, res) => {
+  if ((await roleOf(req.user.id, req.params.id)) !== 'owner') return res.status(403).json({ error: 'Só o dono apaga o grupo' });
+  await deleteGroup(req.params.id); res.json({ ok: true });
+});
+app.post('/groups/:id/avatar', auth, async (req, res) => {
+  if (!isAdm(await roleOf(req.user.id, req.params.id))) return res.status(403).json({ error: 'Só admins mudam a foto' });
+  const a = req.body.avatar; if (!a || !a.startsWith('data:image/') || a.length > 200000) return res.status(400).json({ error: 'Imagem inválida ou muito grande' });
+  await q('update chat_groups set avatar=$1 where id=$2', [a, req.params.id]); changed(req.params.id); res.json({ ok: true });
+});
+app.get('/groups/:id/members', auth, async (req, res) => {
+  if (!(await roleOf(req.user.id, req.params.id))) return res.status(403).json({ error: 'Sem acesso' });
+  res.json((await q('select u.id,u.username,u.avatar,m.role from members m join users u on u.id=m.user_id where m.group_id=$1 order by u.username', [req.params.id])).rows);
+});
+app.post('/groups/:id/members/:uid/role', auth, async (req, res) => {
+  if ((await roleOf(req.user.id, req.params.id)) !== 'owner') return res.status(403).json({ error: 'Só o dono muda cargos' });
+  await q('update members set role=$1 where group_id=$2 and user_id=$3', [req.body.role === 'admin' ? 'admin' : 'member', req.params.id, req.params.uid]); changed(req.params.id); res.json({ ok: true });
+});
+app.post('/channels/:id/perms', auth, async (req, res) => {
+  const c = (await q('select * from channels where id=$1', [req.params.id])).rows[0];
+  if (!c || c.type === 'dm' || !isAdm(await roleOf(req.user.id, c.group_id))) return res.status(403).json({ error: 'Sem permissão' });
+  if (!['perm_view', 'perm_write'].includes(req.body.field)) return res.status(400).json({ error: 'Campo inválido' });
+  await q(`update channels set ${req.body.field}=$1 where id=$2`, [req.body.value === 'admin' ? 'admin' : 'all', c.id]); changed(c.group_id); res.json({ ok: true });
+});
+app.delete('/me', auth, async (req, res) => {
+  const u = (await q('select * from users where id=$1', [req.user.id])).rows[0];
+  if (!u || !(await bcrypt.compare(req.body.password || '', u.password_hash))) return res.status(401).json({ error: 'Senha incorreta' });
+  for (const g of (await q('select id from chat_groups where owner_id=$1', [u.id])).rows) await deleteGroup(g.id);
+  const dm = `select id from channels where type='dm' and (name like $1 or name like $2)`, p = [`dm:${u.id}:%`, `dm:%:${u.id}`];
+  await q(`delete from messages where channel_id in (${dm})`, p); await q(`delete from channels where id in (${dm})`, p);
+  await q('delete from members where user_id=$1', [u.id]); await q('delete from friendships where a=$1 or b=$1', [u.id]);
+  await q('delete from messages where username=$1', [u.username]); await q('delete from users where id=$1', [u.id]);
+  io.in('u' + u.id).disconnectSockets(true); res.json({ ok: true });
+});
 app.post('/me/avatar', auth, async (req, res) => {
   const a = req.body.avatar;
   if (!a || !a.startsWith('data:image/') || a.length > 200000) return res.status(400).json({ error: 'Imagem inválida ou muito grande' });
@@ -148,7 +198,8 @@ io.on('connection', socket => {
   q('select group_id from members where user_id=$1', [uid]).then(r => r.rows.forEach(x => socket.join('grp' + x.group_id)));
   socket.on('chat:join', async cid => { if (await access(uid, cid)) socket.join('c' + cid); });
   socket.on('chat:send', async ({ cid, text }) => {
-    if (!text || !(await access(uid, cid))) return;
+    const c = text && await access(uid, cid); if (!c) return;
+    if (c.type === 'text' && c.perm_write === 'admin' && !c.admin) return socket.emit('chat:denied');
     await q('insert into messages(channel_id,username,text) values($1,$2,$3)', [cid, socket.user.username, text]);
     const av = (await q('select avatar from users where id=$1', [uid])).rows[0];
     io.to('c' + cid).emit('chat:msg', { cid, username: socket.user.username, text, created_at: new Date(), avatar: av && av.avatar });
