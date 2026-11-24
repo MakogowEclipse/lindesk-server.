@@ -6,7 +6,7 @@ const { Server } = require('socket.io');
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const SECRET = process.env.JWT_SECRET;
 const q = (t, p) => pool.query(t, p);
-const app = express(); app.use(cors()); app.use(express.json());
+const app = express(); app.use(cors()); app.use(express.json({ limit: '8mb' }));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
@@ -24,7 +24,12 @@ async function init() {
   alter table chat_groups add column if not exists avatar text;
   alter table members add column if not exists role text default 'member';
   alter table channels add column if not exists perm_view text default 'all';
-  alter table channels add column if not exists perm_write text default 'all';`);
+  alter table channels add column if not exists perm_write text default 'all';
+  alter table users add column if not exists banner text;
+  alter table users add column if not exists c1 text;
+  alter table users add column if not exists c2 text;
+  alter table users add column if not exists bio text;
+  create table if not exists images(id text primary key, mime text not null, data bytea not null, created_at timestamptz default now());`);
 }
 const sign = u => jwt.sign({ id: u.id, username: u.username }, SECRET, { expiresIn: '30d' });
 const auth = (req, res, next) => {
@@ -218,6 +223,37 @@ app.post('/me/avatar', auth, async (req, res) => {
   if (!a || !a.startsWith('data:image/') || a.length > 200000) return res.status(400).json({ error: 'Imagem inválida ou muito grande' });
   await q('update users set avatar=$1 where id=$2', [a, req.user.id]); res.json({ ok: true });
 });
+// ---- Perfil, banner e imagens ----
+const crypto = require('crypto');
+const MIMES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+app.post('/upload', auth, async (req, res) => {
+  const m = /^data:(image\/[a-z]+);base64,([A-Za-z0-9+/=]+)$/.exec(req.body.data || '');
+  if (!m || !MIMES.includes(m[1])) return res.status(400).json({ error: 'Imagem inválida' });
+  const buf = Buffer.from(m[2], 'base64');
+  if (!buf.length || buf.length > 4 * 1024 * 1024) return res.status(400).json({ error: 'Imagem muito grande (máx. 4 MB)' });
+  const id = crypto.randomBytes(12).toString('hex');
+  await q('insert into images(id,mime,data) values($1,$2,$3)', [id, m[1], buf]);
+  res.json({ id });
+});
+app.get('/img/:id', async (req, res) => {
+  if (!/^[0-9a-f]{16,32}$/.test(req.params.id)) return res.sendStatus(404);
+  const r = (await q('select mime,data from images where id=$1', [req.params.id])).rows[0];
+  if (!r) return res.sendStatus(404);
+  res.set({ 'Content-Type': r.mime, 'Cache-Control': 'public, max-age=31536000, immutable', 'X-Content-Type-Options': 'nosniff' }).send(r.data);
+});
+app.get('/profile/:username', auth, async (req, res) => {
+  const u = (await q('select id,username,avatar,banner,c1,c2,bio from users where lower(username)=lower($1)', [req.params.username])).rows[0];
+  if (!u) return res.status(404).json({ error: 'Usuário não encontrado' });
+  res.json({ ...u, status: presenceOf(u.id) });
+});
+const HEX = /^#[0-9a-fA-F]{6}$/;
+app.post('/me/profile', auth, async (req, res) => {
+  const { banner, c1, c2, bio } = req.body;
+  if (banner && !(/^[0-9a-f]{16,32}$/.test(banner) && (await q('select 1 from images where id=$1', [banner])).rowCount)) return res.status(400).json({ error: 'Banner inválido' });
+  if ((c1 && !HEX.test(c1)) || (c2 && !HEX.test(c2))) return res.status(400).json({ error: 'Cor inválida' });
+  await q('update users set banner=$1,c1=$2,c2=$3,bio=$4 where id=$5', [banner || null, c1 || null, c2 || null, String(bio || '').slice(0, 190), req.user.id]);
+  res.json({ ok: true });
+});
 async function voiceUsers(cid) {
   const n = [...(io.sockets.adapter.rooms.get('v' + cid) || [])].map(id => io.sockets.sockets.get(id).user.username);
   return n.length ? (await q('select username,avatar from users where username=any($1)', [n])).rows : [];
@@ -243,7 +279,7 @@ io.on('connection', socket => {
     await q('insert into messages(channel_id,username,text) values($1,$2,$3)', [cid, socket.user.username, text]);
     const av = (await q('select avatar from users where id=$1', [uid])).rows[0];
     io.to('c' + cid).emit('chat:msg', { cid, username: socket.user.username, text, created_at: new Date(), avatar: av && av.avatar });
-    if (c.type === 'dm') { const o = uids(c).find(x => x !== uid); io.to('u' + o).emit('notify', { kind: 'dm', cid, username: socket.user.username, text: text.slice(0, 120) }); }
+    if (c.type === 'dm') { const o = uids(c).find(x => x !== uid); io.to('u' + o).emit('notify', { kind: 'dm', cid, username: socket.user.username, text: /^\[img:[0-9a-f]+\]$/.test(text) ? '📷 Imagem' : text.slice(0, 120) }); }
   });
   socket.on('voice:query', async gid => {
     if (!(await q('select 1 from members where group_id=$1 and user_id=$2', [gid, uid])).rowCount) return;
